@@ -60,6 +60,9 @@ app = FastAPI(
 executor = ThreadPoolExecutor(max_workers=1)
 # job id -> "running" | "done" | "failed"
 jobs: Dict[str, str] = {}
+# AlignmentPipeline chdirs into the job's temp dir, which is deleted when the
+# job ends; each job returns here so the next clone has a valid cwd.
+APP_DIR = os.getcwd()
 
 
 class JobRequest(BaseModel):
@@ -85,8 +88,15 @@ async def submit_job(job: JobRequest):
     if status in ("running", "done"):
         return JSONResponse(status_code=200, content={"status": status})
 
+    # Set before submitting so a fast job's "done" isn't overwritten.
     jobs[job.id] = "running"
-    executor.submit(_run_job, job.id, job.payload)
+    try:
+        executor.submit(_run_job, job.id, job.payload)
+    except RuntimeError as e:
+        # The executor is shutting down; let the Durable Object retry later.
+        jobs.pop(job.id, None)
+        logger.error(f"Could not start job {job.id}: {e}")
+        return JSONResponse(status_code=503, content={"status": "unavailable"})
     return JSONResponse(status_code=202, content={"status": "running"})
 
 
@@ -110,6 +120,8 @@ def _run_job(job_id: str, payload: Dict[str, Any]) -> None:
     except (Exception, SystemExit) as e:
         jobs[job_id] = "failed"
         logger.error(f"Job {job_id} for {user}/{repo} failed: {e}", exc_info=True)
+    finally:
+        os.chdir(APP_DIR)
 
 
 def run_greekroom_checks(message: Dict[str, Any], tempdir: str):

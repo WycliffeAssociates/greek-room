@@ -9,8 +9,12 @@ const MAX_RUN_MINUTES = 45;
 const CHECK_INTERVAL_S = 60;
 /** Finished jobs are deleted after this long. */
 const RETENTION_DAYS = 30;
+/** Dispatch can include a container cold start. */
+const DISPATCH_TIMEOUT_MS = 5 * 60 * 1000;
+const STATUS_TIMEOUT_MS = 30 * 1000;
 
-type JobStatus = "pending" | "running" | "done" | "failed";
+// superseded: requeued while a newer job for the same repo was already pending
+type JobStatus = "pending" | "running" | "done" | "failed" | "superseded";
 
 type JobRow = {
 	id: string;
@@ -69,6 +73,13 @@ export class PipelineWorkerContainer extends Container<Env> {
 				last_error TEXT
 			)
 		`);
+		// next_check_at: when the scheduled checkJobs run is due (unix seconds)
+		state.storage.sql.exec(`
+			CREATE TABLE IF NOT EXISTS queue_state (
+				key TEXT PRIMARY KEY,
+				value INTEGER NOT NULL
+			)
+		`);
 	}
 
 	/**
@@ -80,7 +91,8 @@ export class PipelineWorkerContainer extends Container<Env> {
 		const payload = JSON.stringify(message);
 
 		// Merge repeated pushes into the repo's pending job. The job clones the
-		// repo when it starts, so it picks up the latest push either way.
+		// repo when it starts, so it picks up the latest push either way. The
+		// pending job may be a requeued one; the new push gets fresh attempts.
 		const [pending] = this.query<{ id: string }>(
 			"SELECT id FROM jobs WHERE repo_key = ? AND status = 'pending' LIMIT 1",
 			repoKey,
@@ -88,7 +100,10 @@ export class PipelineWorkerContainer extends Container<Env> {
 		let id: string;
 		if (pending) {
 			id = pending.id;
-			this.query("UPDATE jobs SET payload = ? WHERE id = ?", payload, id);
+			this.query(
+				"UPDATE jobs SET payload = ?, attempts = 0, last_error = NULL WHERE id = ?",
+				payload, id,
+			);
 		} else {
 			id = crypto.randomUUID();
 			this.query(
@@ -126,7 +141,7 @@ export class PipelineWorkerContainer extends Container<Env> {
 			// requeued job is dispatched on the next check.
 			if (!killed) await this.dispatch();
 			this.query(
-				"DELETE FROM jobs WHERE status IN ('done', 'failed') AND finished_at < ?",
+				"DELETE FROM jobs WHERE status IN ('done', 'failed', 'superseded') AND finished_at < ?",
 				Date.now() - RETENTION_DAYS * 24 * 60 * 60 * 1000,
 			);
 		} finally {
@@ -152,14 +167,17 @@ export class PipelineWorkerContainer extends Container<Env> {
 		console.log("Container stopped", params);
 	}
 
-	/** Send the oldest pending job to the container if no job is running. */
+	/**
+	 * Send the next pending job to the container if no job is running. Jobs
+	 * with fewer attempts go first, so a retried job doesn't hold up other repos.
+	 */
 	private async dispatch(): Promise<void> {
 		if (this.dispatching) return;
 		this.dispatching = true;
 		try {
 			if (this.query("SELECT 1 FROM jobs WHERE status = 'running' LIMIT 1").length) return;
 			const [job] = this.query<JobRow>(
-				"SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at LIMIT 1",
+				"SELECT * FROM jobs WHERE status = 'pending' ORDER BY attempts, created_at LIMIT 1",
 			);
 			if (!job) return;
 
@@ -170,6 +188,7 @@ export class PipelineWorkerContainer extends Container<Env> {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
 					body: JSON.stringify({ id: job.id, payload: JSON.parse(job.payload) }),
+					signal: AbortSignal.timeout(DISPATCH_TIMEOUT_MS),
 				});
 				if (res.ok) {
 					this.query(
@@ -180,6 +199,13 @@ export class PipelineWorkerContainer extends Container<Env> {
 					return;
 				}
 				error = `dispatch failed: HTTP ${res.status} ${await res.text()}`;
+				if (res.status >= 400 && res.status < 500) {
+					// The container rejected the job itself; retrying won't help and
+					// would block the queue.
+					this.finish(job, "failed", error);
+					console.error(`Job ${job.id} for ${job.repo_key} rejected: ${error}`);
+					return;
+				}
 			} catch (e) {
 				error = `dispatch failed: ${e}`;
 			}
@@ -205,7 +231,9 @@ export class PipelineWorkerContainer extends Container<Env> {
 
 		let status: string;
 		try {
-			const res = await this.containerFetch(`http://container/jobs/${job.id}`);
+			const res = await this.containerFetch(`http://container/jobs/${job.id}`, {
+				signal: AbortSignal.timeout(STATUS_TIMEOUT_MS),
+			});
 			if (!res.ok) throw new Error(`HTTP ${res.status}`);
 			status = ((await res.json()) as { status: string }).status;
 		} catch (e) {
@@ -217,10 +245,7 @@ export class PipelineWorkerContainer extends Container<Env> {
 
 		switch (status) {
 			case "done":
-				this.query(
-					"UPDATE jobs SET status = 'done', finished_at = ? WHERE id = ?",
-					Date.now(), job.id,
-				);
+				this.finish(job, "done");
 				console.log(`Job ${job.id} for ${job.repo_key} done`);
 				return false;
 			case "failed":
@@ -241,13 +266,20 @@ export class PipelineWorkerContainer extends Container<Env> {
 		}
 	}
 
-	/** Put a job back in the queue, or mark it failed after MAX_ATTEMPTS. */
+	/**
+	 * Put a job back in the queue, or mark it failed after MAX_ATTEMPTS. If a
+	 * newer job for the same repo is already pending, that job covers this one.
+	 */
 	private requeue(job: JobRow, reason: string): void {
-		if (job.attempts >= MAX_ATTEMPTS) {
-			this.query(
-				"UPDATE jobs SET status = 'failed', finished_at = ?, last_error = ? WHERE id = ?",
-				Date.now(), reason, job.id,
-			);
+		const [newer] = this.query<{ id: string }>(
+			"SELECT id FROM jobs WHERE repo_key = ? AND status = 'pending' AND id != ? LIMIT 1",
+			job.repo_key, job.id,
+		);
+		if (newer) {
+			this.finish(job, "superseded", `${reason}; superseded by job ${newer.id}`);
+			console.warn(`Job ${job.id} for ${job.repo_key} superseded by ${newer.id}: ${reason}`);
+		} else if (job.attempts >= MAX_ATTEMPTS) {
+			this.finish(job, "failed", reason);
 			console.error(`Job ${job.id} for ${job.repo_key} failed after ${job.attempts} attempts: ${reason}`);
 		} else {
 			this.query("UPDATE jobs SET status = 'pending', last_error = ? WHERE id = ?", reason, job.id);
@@ -255,16 +287,29 @@ export class PipelineWorkerContainer extends Container<Env> {
 		}
 	}
 
+	private finish(job: JobRow, status: "done" | "failed" | "superseded", error?: string): void {
+		this.query(
+			"UPDATE jobs SET status = ?, finished_at = ?, last_error = COALESCE(?, last_error) WHERE id = ?",
+			status, Date.now(), error ?? null, job.id,
+		);
+	}
+
 	/** Schedule checkJobs unless a future run is already scheduled. */
 	private async ensureChecker(): Promise<void> {
-		// Reads the library's schedule table directly because listSchedules()
-		// also returns the checkJobs run in progress, which the library deletes
-		// after the callback returns. Only future runs count.
-		const scheduled = this.query(
-			"SELECT 1 FROM container_schedules WHERE callback = 'checkJobs' AND time > ? LIMIT 1",
-			Math.floor(Date.now() / 1000),
+		// While checkJobs runs, its own due time has passed, so it can schedule
+		// the next run; an enqueue during that run schedules it instead, and
+		// checkJobs then sees a future time and doesn't add a second one.
+		const [next] = this.query<{ value: number }>(
+			"SELECT value FROM queue_state WHERE key = 'next_check_at'",
 		);
-		if (!scheduled.length) await this.schedule(CHECK_INTERVAL_S, "checkJobs");
+		if (next && next.value > Date.now() / 1000) return;
+		// The library runs the callback once `time` (unix seconds) has passed,
+		// so store that exact value.
+		const { time } = await this.schedule(CHECK_INTERVAL_S, "checkJobs");
+		this.query(
+			"INSERT OR REPLACE INTO queue_state (key, value) VALUES ('next_check_at', ?)",
+			time,
+		);
 	}
 
 	private hasActiveJobs(): boolean {
