@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """
-FastAPI webhook endpoint for receiving Service Bus messages.
+FastAPI job runner for the Greek Room pipeline container.
 
-This module provides a webhook endpoint that receives POST requests
-with payloads similar to the message structure processed by
-ServiceBusListener._process_message().
+The PipelineWorkerContainer Durable Object owns the job queue. It sends
+one job at a time to POST /jobs and polls GET /jobs/{id} until the job
+is done or failed. Job state here is in memory only: if the container
+restarts, unknown ids tell the Durable Object to dispatch the job again.
 """
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import logging
 import tempfile
 from pathlib import Path
 from typing import Any, Dict
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from git import Repo
 from jinja2 import Environment, FileSystemLoader
 from alignment_pipeline import AlignmentPipeline
@@ -46,10 +49,26 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Greek Room Pipeline Webhook",
-    description="Webhook endpoint for receiving Service Bus messages",
-    version="1.0.0",
+    title="Greek Room Pipeline Job Runner",
+    description="Runs Greek Room checks for jobs dispatched by the PipelineWorkerContainer Durable Object",
+    version="1.1.0",
 )
+
+# One job at a time; the Durable Object also dispatches one at a time.
+# The worker thread is not a daemon, so a SIGTERM (deploy, idle stop) lets
+# the current job finish. The Durable Object uses SIGKILL for hung jobs.
+executor = ThreadPoolExecutor(max_workers=1)
+# job id -> "running" | "done" | "failed"
+jobs: Dict[str, str] = {}
+# AlignmentPipeline chdirs into the job's temp dir, which is deleted when the
+# job ends; each job returns here so the next clone has a valid cwd.
+APP_DIR = os.getcwd()
+
+
+class JobRequest(BaseModel):
+    id: str
+    payload: Dict[str, Any]
+
 
 @app.get("/health")
 async def health():
@@ -57,51 +76,53 @@ async def health():
     return {"status": "healthy"}
 
 
-@app.post("/webhook")
-async def receive_webhook(message: Dict[str, Any]):
+@app.post("/jobs")
+async def submit_job(job: JobRequest):
     """
-    Receive a webhook POST request with message payload.
-    
-    This endpoint accepts POST requests with payloads similar to the
-    message structure processed by ServiceBusListener._process_message().
-    
-    Args:
-        message: The webhook message payload as a JSON object
-        
-    Returns:
-        JSON response with processing status
-        
-    Raises:
-        HTTPException: If message validation or processing fails
+    Start a job in the background and return immediately.
+
+    A repeated dispatch of a job that is already running or done is a no-op,
+    so the Durable Object can safely retry the request.
     """
+    status = jobs.get(job.id)
+    if status in ("running", "done"):
+        return JSONResponse(status_code=200, content={"status": status})
 
-    topics = message.get("Topics", [])
-    event_type = message.get("EventType")
-    # Check if it is a consolidated repo update
-    if "consolidated" not in topics or event_type not in ("push", "create"):
-        logger.info(f"Skipping message - 'consolidated' not in Topics or invalid EventType: Topics={topics}, EventType={event_type}")
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "skipped"
-            }
-        )
+    # Set before submitting so a fast job's "done" isn't overwritten.
+    jobs[job.id] = "running"
+    try:
+        executor.submit(_run_job, job.id, job.payload)
+    except RuntimeError as e:
+        # The executor is shutting down; let the Durable Object retry later.
+        jobs.pop(job.id, None)
+        logger.error(f"Could not start job {job.id}: {e}")
+        return JSONResponse(status_code=503, content={"status": "unavailable"})
+    return JSONResponse(status_code=202, content={"status": "running"})
 
+
+@app.get("/jobs/{job_id}")
+async def get_job(job_id: str):
+    """Return the job's status, or "unknown" if this container never ran it."""
+    return {"status": jobs.get(job_id, "unknown")}
+
+
+def _run_job(job_id: str, payload: Dict[str, Any]) -> None:
+    user = payload.get("User")
+    repo = payload.get("Repo")
+    logger.info(f"Starting job {job_id} for {user}/{repo}")
     try:
         with tempfile.TemporaryDirectory() as tempdir:
-            run_greekroom_checks(message, tempdir)
-        
-        return JSONResponse(
-            status_code=200,
-            content={"status": "success"}
-        )
-        
-    except Exception as e:
-        logger.error(f"Error processing webhook message: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error processing webhook message: {str(e)}"
-        )
+            run_greekroom_checks(payload, tempdir)
+        jobs[job_id] = "done"
+        logger.info(f"Finished job {job_id} for {user}/{repo}")
+    # AlignmentPipeline calls sys.exit() on some errors, which raises
+    # SystemExit (not an Exception) in this thread.
+    except (Exception, SystemExit) as e:
+        jobs[job_id] = "failed"
+        logger.error(f"Job {job_id} for {user}/{repo} failed: {e}", exc_info=True)
+    finally:
+        os.chdir(APP_DIR)
+
 
 def run_greekroom_checks(message: Dict[str, Any], tempdir: str):
     repo_html_url = message.get("RepoHtmlUrl")
@@ -109,10 +130,9 @@ def run_greekroom_checks(message: Dict[str, Any], tempdir: str):
     user = message.get("User")
     repo = message.get("Repo")
     tempdir_path = Path(tempdir)
-    
-    os.chdir(tempdir_path)
-    Repo.clone_from(repo_html_url, str(repo))
+
     repo_dir = tempdir_path / repo
+    Repo.clone_from(repo_html_url, str(repo_dir))
     
     wildebeest_results, ref_id_dict = run_wildebeest_analysis(repo_dir)
     
