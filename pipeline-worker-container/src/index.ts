@@ -1,4 +1,5 @@
 import { getContainer } from "@cloudflare/containers";
+import { WorkerEntrypoint } from "cloudflare:workers";
 import type { PipelineWorkerContainer } from "./container";
 import { parseWebhook } from "./webhook";
 
@@ -7,20 +8,10 @@ export { PipelineWorkerContainer } from "./container";
 
 type ContainerStub = DurableObjectStub<PipelineWorkerContainer>;
 
-/** Store webhook messages as jobs; the container runs them in the background. */
-async function handleWebhook(request: Request, container: ContainerStub): Promise<Response> {
-	const parsed = await parseWebhook(request);
-	switch (parsed.action) {
-		case "reject":
-			return Response.json({ status: "error", detail: parsed.detail }, { status: 400 });
-		case "skip":
-			return Response.json({ status: "skipped" }, { status: 200 });
-		case "enqueue": {
-			const id = await container.enqueue(parsed.message);
-			return Response.json({ status: "accepted", id }, { status: 202 });
-		}
-	}
-}
+export type EnqueueResult =
+	| { status: "accepted"; id: string }
+	| { status: "skipped" } // not a consolidated push/create
+	| { status: "rejected"; detail: string };
 
 async function handleHealth(container: ContainerStub): Promise<Response> {
 	if (await container.healthCheck()) {
@@ -42,25 +33,42 @@ async function handleJobs(request: Request, container: ContainerStub, token: str
 
 /**
  * Worker entry point for pipeline-worker container.
+ *
+ * Jobs are queued only through the enqueue() RPC method, which other Workers
+ * on this account reach through a service binding. There's no public HTTP
+ * route for it, so nobody outside the account can queue jobs.
  */
-export default {
+export default class PipelineWorker extends WorkerEntrypoint<Env> {
+	private container() {
+		const env: Env = this.env;
+		return getContainer(env.PIPELINE_WORKER_CONTAINER, "pipeline-worker");
+	}
 
-	async fetch(request: Request, env: Env): Promise<Response> {
-		const container = getContainer(env.PIPELINE_WORKER_CONTAINER, "pipeline-worker");
+	/** Store a WACSEvent message as a job; the container runs it in the background. */
+	async enqueue(message: unknown): Promise<EnqueueResult> {
+		const parsed = parseWebhook(message);
+		switch (parsed.action) {
+			case "reject":
+				return { status: "rejected", detail: parsed.detail };
+			case "skip":
+				return { status: "skipped" };
+			case "enqueue":
+				return { status: "accepted", id: await this.container().enqueue(parsed.message) };
+		}
+	}
+
+	async fetch(request: Request): Promise<Response> {
+		const container = this.container();
 
 		try {
 			const path = new URL(request.url).pathname;
-
-			if (path === "/webhook" && request.method === "POST") {
-				return await handleWebhook(request, container);
-			}
 
 			if (path === "/health" && request.method === "GET") {
 				return await handleHealth(container);
 			}
 
 			// Only enabled when the JOBS_TOKEN secret is set
-			const jobsToken = (env as any).JOBS_TOKEN as string | undefined;
+			const jobsToken = (this.env as any).JOBS_TOKEN as string | undefined;
 			if (path === "/jobs" && request.method === "GET" && jobsToken) {
 				return await handleJobs(request, container, jobsToken);
 			}
@@ -72,4 +80,4 @@ export default {
 			return new Response("Container error", { status: 500 });
 		}
 	}
-};
+}

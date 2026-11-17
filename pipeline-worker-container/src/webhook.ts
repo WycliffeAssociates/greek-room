@@ -9,17 +9,12 @@ export type ParsedWebhook =
 	| { action: "skip" }
 	| { action: "reject"; detail: string };
 
-/** Parse a webhook request. Only consolidated-repo pushes and creates are enqueued. */
-export async function parseWebhook(request: Request): Promise<ParsedWebhook> {
-	let message: Record<string, unknown>;
-	try {
-		message = await request.json();
-	} catch {
-		return { action: "reject", detail: "Invalid JSON" };
-	}
-	if (!message || typeof message !== "object" || Array.isArray(message)) {
+/** Check a WACSEvent message. Only consolidated-repo pushes and creates are enqueued. */
+export function parseWebhook(value: unknown): ParsedWebhook {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
 		return { action: "reject", detail: "Expected a JSON object" };
 	}
+	const message = value as Record<string, unknown>;
 
 	const topics = Array.isArray(message.Topics) ? message.Topics : [];
 	if (!topics.includes("consolidated") || !["push", "create"].includes(message.EventType as string)) {
