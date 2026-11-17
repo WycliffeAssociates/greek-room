@@ -16,16 +16,41 @@ type Env = {
 
 type Outcome =
 	| "accepted" // 202: the pipeline worker queued a job
-	| "skipped" // 200: the pipeline worker filtered it out (not a consolidated push/create)
-	| "rejected" // 4xx: the message is malformed; left for redelivery and then dead-lettering
+	| "skipped" // not a consolidated push/create; acked without forwarding (or the webhook answered 200)
+	| "rejected" // invalid JSON or 4xx: left for redelivery and then dead-lettering
 	| "error"; // 5xx or unreachable: stop the run and retry next hour
 
+/**
+ * Only consolidated-repo pushes and creates are forwarded; the same filter as
+ * the pipeline worker's parseWebhook and the old Python Service Bus listener.
+ */
+function isConsolidatedPush(message: Record<string, unknown>): boolean {
+	const topics = Array.isArray(message.Topics) ? message.Topics : [];
+	return topics.includes("consolidated") && ["push", "create"].includes(message.EventType as string);
+}
+
 async function forward(env: Env, message: ReceivedMessage): Promise<Outcome> {
+	// Strip a UTF-8 BOM, which JSON.parse rejects
+	const body = message.body.replace(/^﻿/, "");
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(body);
+	} catch {
+		console.error(`Message ${message.messageId} is not valid JSON`);
+		return "rejected";
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		console.error(`Message ${message.messageId} is not a JSON object`);
+		return "rejected";
+	}
+	if (!isConsolidatedPush(parsed as Record<string, unknown>)) {
+		return "skipped";
+	}
+
 	const response = await env.PIPELINE_WORKER.fetch("https://pipeline-worker/webhook", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		// Strip a UTF-8 BOM, which JSON.parse rejects
-		body: message.body.replace(/^﻿/, ""),
+		body,
 	});
 	const detail = await response.text();
 	if (response.status === 202) {
@@ -68,7 +93,7 @@ async function drainSubscription(env: Env): Promise<void> {
 		counts[outcome]++;
 
 		if (outcome === "accepted" || outcome === "skipped") {
-			// Acknowledge only once the webhook has taken (or deliberately dropped) the message
+			// Ack once the webhook has taken the message, or when it was filtered out
 			await client.complete(message);
 		} else if (outcome === "error") {
 			// The pipeline worker is down; the lock expires and the message is redelivered
