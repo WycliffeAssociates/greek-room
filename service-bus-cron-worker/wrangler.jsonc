@@ -1,6 +1,6 @@
 /**
  * Cron Worker that drains the WACSEvent/GreekRoom Service Bus subscription
- * every hour and forwards each message to the pipeline worker's /webhook.
+ * every hour and queues each message on the pipeline worker through its enqueue() RPC.
  *
  * Secret (set with `wrangler secret put SERVICE_BUS_CONNECTION_STRING`):
  *   SERVICE_BUS_CONNECTION_STRING  Endpoint=sb://...;SharedAccessKeyName=...;SharedAccessKey=...
