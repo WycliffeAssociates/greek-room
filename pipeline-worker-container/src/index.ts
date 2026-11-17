@@ -23,16 +23,13 @@ async function handleWebhook(request: Request, container: ContainerStub): Promis
 }
 
 async function handleHealth(container: ContainerStub): Promise<Response> {
-	const healthResponse = await container.fetch(new Request("http://container/health"));
-
-	if (healthResponse.ok) {
+	if (await container.healthCheck()) {
 		return new Response("Pipeline worker container is running", {
 			status: 200,
 			headers: { "Content-Type": "text/plain" },
 		});
-	} else {
-		return new Response("Container health check failed", { status: 503 });
 	}
+	return new Response("Container health check failed", { status: 503 });
 }
 
 /** Recent jobs for debugging. */

@@ -59,6 +59,22 @@ export class PipelineWorkerContainer extends Container<Env> {
 		return id;
 	}
 
+	/**
+	 * Whether the container answers its /health endpoint. Starts the container
+	 * if it isn't running, so this can take as long as a cold start.
+	 */
+	async healthCheck(): Promise<boolean> {
+		try {
+			const res = await this.containerFetch("http://container/health", {
+				signal: AbortSignal.timeout(DISPATCH_TIMEOUT_MS),
+			});
+			return res.ok;
+		} catch (e) {
+			console.warn(`Health check failed: ${e}`);
+			return false;
+		}
+	}
+
 	/** The most recent jobs, without payloads, for debugging. */
 	async recentJobs(limit = 20): Promise<JobSummary[]> {
 		return this.jobs.recent(limit);
