@@ -1,0 +1,32 @@
+/**
+ * Cron Worker that drains the WACSEvent/GreekRoom Service Bus subscription
+ * every hour and forwards each message to the pipeline worker's /webhook.
+ *
+ * Secret (set with `wrangler secret put SERVICE_BUS_CONNECTION_STRING`):
+ *   SERVICE_BUS_CONNECTION_STRING  Endpoint=sb://...;SharedAccessKeyName=...;SharedAccessKey=...
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "greekroom-service-bus-cron",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-10-08",
+	"observability": {
+		"enabled": true
+	},
+	"triggers": {
+		"crons": ["0 * * * *"]
+	},
+	/**
+	 * Calls the pipeline worker directly instead of through its public URL.
+	 */
+	"services": [
+		{
+			"binding": "PIPELINE_WORKER",
+			"service": "greekroom-pipeline-worker"
+		}
+	],
+	"vars": {
+		"TOPIC_NAME": "WACSEvent",
+		"SUBSCRIPTION_NAME": "GreekRoom"
+	}
+}
