@@ -23,10 +23,6 @@ export async function parseWebhook(request: Request): Promise<ParsedWebhook> {
 
 	const topics = Array.isArray(message.Topics) ? message.Topics : [];
 	if (!topics.includes("consolidated") || !["push", "create"].includes(message.EventType as string)) {
-		console.log(
-			`Skipping message - 'consolidated' not in Topics or invalid EventType: ` +
-			`Topics=${JSON.stringify(message.Topics ?? [])}, EventType=${message.EventType}`,
-		);
 		return { action: "skip" };
 	}
 	if (!message.User || !message.Repo || !message.RepoHtmlUrl) {
