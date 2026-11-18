@@ -1,6 +1,6 @@
 import { Container, type StopParams } from "@cloudflare/containers";
 import { env } from "cloudflare:workers";
-import { JobStore, type JobRow, type JobSummary } from "./jobs";
+import { JobStore, type JobRow, type JobSummary, type RetryResult } from "./jobs";
 import type { WebhookMessage } from "./webhook";
 
 /** About 2x a normal run. Only catches hung jobs; live jobs are never cut short. */
@@ -78,6 +78,16 @@ export class PipelineWorkerContainer extends Container<Env> {
 	/** The most recent jobs, without payloads, for debugging. */
 	async recentJobs(limit = 20): Promise<JobSummary[]> {
 		return this.jobs.recent(limit);
+	}
+
+	/** Requeue failed jobs (all, or the given ids) and start the queue. */
+	async retryFailed(ids?: string[]): Promise<RetryResult> {
+		const result = this.jobs.retryFailed(ids);
+		if (result.retried.length > 0) {
+			await this.ensureChecker();
+			this.ctx.waitUntil(this.dispatch());
+		}
+		return result;
 	}
 
 	/**

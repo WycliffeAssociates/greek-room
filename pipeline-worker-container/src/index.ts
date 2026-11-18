@@ -1,7 +1,7 @@
 import { getContainer } from "@cloudflare/containers";
 import { WorkerEntrypoint } from "cloudflare:workers";
 import type { PipelineWorkerContainer } from "./container";
-import { parseWebhook } from "./webhook";
+import { parseJobRequest, parseWebhook } from "./webhook";
 
 // Durable Object classes must be exported from the Worker's main module.
 export { PipelineWorkerContainer } from "./container";
@@ -23,20 +23,64 @@ async function handleHealth(container: ContainerStub): Promise<Response> {
 	return new Response("Container health check failed", { status: 503 });
 }
 
+/** Whether the request carries `Authorization: Bearer <token>`, compared in constant time. */
+function isAuthorized(request: Request, token: string): boolean {
+	const encoder = new TextEncoder();
+	const given = encoder.encode(request.headers.get("Authorization") ?? "");
+	const expected = encoder.encode(`Bearer ${token}`);
+	return given.byteLength === expected.byteLength && crypto.subtle.timingSafeEqual(given, expected);
+}
+
 /** Recent jobs for debugging. */
-async function handleJobs(request: Request, container: ContainerStub, token: string): Promise<Response> {
-	if (request.headers.get("Authorization") !== `Bearer ${token}`) {
-		return new Response("Unauthorized", { status: 401 });
-	}
+async function handleJobs(container: ContainerStub): Promise<Response> {
 	return Response.json(await container.recentJobs(20));
+}
+
+/** Queue a job for a repo: `{"User", "Repo", "RepoHtmlUrl", "DefaultBranch"?}`. */
+async function handleSubmit(request: Request, container: ContainerStub): Promise<Response> {
+	let body: unknown;
+	try {
+		body = await request.json();
+	} catch {
+		return new Response("Body must be JSON", { status: 400 });
+	}
+	const parsed = parseJobRequest(body);
+	if ("error" in parsed) {
+		return new Response(parsed.error, { status: 400 });
+	}
+	return Response.json({ id: await container.enqueue(parsed.message) }, { status: 202 });
+}
+
+/**
+ * Requeue failed jobs. The body is optional: `{"ids": ["<job id>", ...]}`
+ * retries those jobs; no body retries every failed job.
+ */
+async function handleRetry(request: Request, container: ContainerStub): Promise<Response> {
+	let ids: string[] | undefined;
+	const body = await request.text();
+	if (body.trim()) {
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(body);
+		} catch {
+			return new Response("Body must be JSON", { status: 400 });
+		}
+		const value = (parsed as { ids?: unknown })?.ids;
+		if (!Array.isArray(value) || value.length === 0 || !value.every((id) => typeof id === "string")) {
+			return new Response('Body must be {"ids": ["<job id>", ...]}', { status: 400 });
+		}
+		ids = value;
+	}
+	return Response.json(await container.retryFailed(ids));
 }
 
 /**
  * Worker entry point for pipeline-worker container.
  *
- * Jobs are queued only through the enqueue() RPC method, which other Workers
- * on this account reach through a service binding. There's no public HTTP
- * route for it, so nobody outside the account can queue jobs.
+ * WACSEvent jobs are queued through the enqueue() RPC method, which other
+ * Workers on this account reach through a service binding. The HTTP /jobs
+ * routes (list, submit, retry) need the JOBS_TOKEN secret, and are disabled
+ * (404) until it is set.
  */
 export default class PipelineWorker extends WorkerEntrypoint<Env> {
 	private container() {
@@ -67,10 +111,19 @@ export default class PipelineWorker extends WorkerEntrypoint<Env> {
 				return await handleHealth(container);
 			}
 
-			// Only enabled when the JOBS_TOKEN secret is set
+			// The /jobs routes are only enabled when the JOBS_TOKEN secret is set
 			const jobsToken = (this.env as any).JOBS_TOKEN as string | undefined;
-			if (path === "/jobs" && request.method === "GET" && jobsToken) {
-				return await handleJobs(request, container, jobsToken);
+			const jobsRoutes: Record<string, () => Promise<Response>> = {
+				"GET /jobs": () => handleJobs(container),
+				"POST /jobs": () => handleSubmit(request, container),
+				"POST /jobs/retry": () => handleRetry(request, container),
+			};
+			const route = jobsRoutes[`${request.method} ${path}`];
+			if (route && jobsToken) {
+				if (!isAuthorized(request, jobsToken)) {
+					return new Response("Unauthorized", { status: 401 });
+				}
+				return await route();
 			}
 
 			// Return 404 for unknown routes

@@ -22,6 +22,11 @@ export type JobRow = {
 
 export type JobSummary = Omit<JobRow, "payload">;
 
+export type RetryResult = {
+	retried: { id: string; repo_key: string }[];
+	skipped: { id: string; repo_key: string | null; reason: string }[];
+};
+
 /**
  * The job queue, stored in the Durable Object's SQLite storage. Every method
  * is synchronous, so each one runs without interleaving with other requests.
@@ -139,6 +144,49 @@ export class JobStore {
 			this.query("UPDATE jobs SET status = 'pending', last_error = ? WHERE id = ?", reason, job.id);
 			console.warn(`Job ${job.id} for ${job.repo_key} requeued after attempt ${job.attempts}: ${reason}`);
 		}
+	}
+
+	/**
+	 * Put failed jobs back in the queue with fresh attempts: the given ids, or
+	 * every failed job. Only the newest failed job per repo is retried, and none
+	 * for a repo that already has a pending or running job: each run clones the
+	 * repo's latest state, so one job per repo covers the rest.
+	 */
+	retryFailed(ids?: string[]): RetryResult {
+		const result: RetryResult = { retried: [], skipped: [] };
+		const failed = this.query<{ id: string; repo_key: string }>(
+			"SELECT id, repo_key FROM jobs WHERE status = 'failed' ORDER BY created_at DESC",
+		);
+		const wanted = ids ? new Set(ids) : undefined;
+		const covered = new Map<string, string>(); // repo_key -> job id covering it
+		for (const { id, repo_key } of this.query<{ id: string; repo_key: string }>(
+			"SELECT id, repo_key FROM jobs WHERE status IN ('pending', 'running')",
+		)) {
+			covered.set(repo_key, id);
+		}
+
+		for (const job of failed) {
+			if (wanted && !wanted.has(job.id)) continue;
+			wanted?.delete(job.id);
+			const coveredBy = covered.get(job.repo_key);
+			if (coveredBy) {
+				result.skipped.push({ ...job, reason: `repo already has job ${coveredBy}` });
+				continue;
+			}
+			this.query(
+				`UPDATE jobs SET status = 'pending', attempts = 0, started_at = NULL,
+				 finished_at = NULL, last_error = NULL WHERE id = ?`,
+				job.id,
+			);
+			covered.set(job.repo_key, job.id);
+			result.retried.push(job);
+			console.log(`Job ${job.id} for ${job.repo_key} retried`);
+		}
+
+		for (const id of wanted ?? []) {
+			result.skipped.push({ id, repo_key: null, reason: "no failed job with this id" });
+		}
+		return result;
 	}
 
 	purgeFinished(): void {
