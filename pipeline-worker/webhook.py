@@ -10,6 +10,8 @@ restarts, unknown ids tell the Durable Object to dispatch the job again.
 
 import json
 import os
+import signal
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import logging
@@ -58,11 +60,33 @@ app = FastAPI(
 # The worker thread is not a daemon, so a SIGTERM (deploy, idle stop) lets
 # the current job finish. The Durable Object uses SIGKILL for hung jobs.
 executor = ThreadPoolExecutor(max_workers=1)
-# job id -> "running" | "done" | "failed"
-jobs: Dict[str, str] = {}
+# job id -> {"status": "running" | "done" | "failed", "error"?: str, "retryable"?: bool}
+jobs: Dict[str, Dict[str, Any]] = {}
 # AlignmentPipeline chdirs into the job's temp dir, which is deleted when the
 # job ends; each job returns here so the next clone has a valid cwd.
 APP_DIR = os.getcwd()
+
+
+class AlignmentError(Exception):
+    """
+    The alignment step failed. It only computes on the downloaded repo and
+    source text, so a retry fails the same way (e.g. ualign.py running out of
+    memory); the Durable Object doesn't retry these jobs.
+    """
+
+
+def _describe_error(e: BaseException) -> str:
+    """A one-line description of an error, for the job status."""
+    if isinstance(e, subprocess.CalledProcessError):
+        script = next((Path(str(arg)).name for arg in e.cmd if str(arg).endswith(".py")), Path(str(e.cmd[0])).name)
+        if e.returncode < 0:
+            sig = signal.Signals(-e.returncode).name
+            hint = " (probably out of memory)" if sig == "SIGKILL" else ""
+            return f"{script} was killed by {sig}{hint}"
+        return f"{script} exited with code {e.returncode}"
+    if isinstance(e, SystemExit):
+        return f"exited with code {e.code}"
+    return f"{type(e).__name__}: {e}"
 
 
 class JobRequest(BaseModel):
@@ -84,12 +108,12 @@ async def submit_job(job: JobRequest):
     A repeated dispatch of a job that is already running or done is a no-op,
     so the Durable Object can safely retry the request.
     """
-    status = jobs.get(job.id)
+    status = jobs.get(job.id, {}).get("status")
     if status in ("running", "done"):
         return JSONResponse(status_code=200, content={"status": status})
 
     # Set before submitting so a fast job's "done" isn't overwritten.
-    jobs[job.id] = "running"
+    jobs[job.id] = {"status": "running"}
     try:
         executor.submit(_run_job, job.id, job.payload)
     except RuntimeError as e:
@@ -102,8 +126,11 @@ async def submit_job(job: JobRequest):
 
 @app.get("/jobs/{job_id}")
 async def get_job(job_id: str):
-    """Return the job's status, or "unknown" if this container never ran it."""
-    return {"status": jobs.get(job_id, "unknown")}
+    """
+    Return the job's status, or "unknown" if this container never ran it.
+    A failed job also has "error" and "retryable".
+    """
+    return jobs.get(job_id, {"status": "unknown"})
 
 
 def _run_job(job_id: str, payload: Dict[str, Any]) -> None:
@@ -113,13 +140,15 @@ def _run_job(job_id: str, payload: Dict[str, Any]) -> None:
     try:
         with tempfile.TemporaryDirectory() as tempdir:
             run_greekroom_checks(payload, tempdir)
-        jobs[job_id] = "done"
+        jobs[job_id] = {"status": "done"}
         logger.info(f"Finished job {job_id} for {user}/{repo}")
     # AlignmentPipeline calls sys.exit() on some errors, which raises
     # SystemExit (not an Exception) in this thread.
     except (Exception, SystemExit) as e:
-        jobs[job_id] = "failed"
-        logger.error(f"Job {job_id} for {user}/{repo} failed: {e}", exc_info=True)
+        retryable = not isinstance(e, AlignmentError)
+        error = _describe_error(e) if retryable else f"alignment failed: {e}"
+        jobs[job_id] = {"status": "failed", "error": error[:500], "retryable": retryable}
+        logger.error(f"Job {job_id} for {user}/{repo} failed (retryable={retryable}): {error}", exc_info=True)
     finally:
         os.chdir(APP_DIR)
 
@@ -190,7 +219,11 @@ def run_greekroom_checks(message: Dict[str, Any], tempdir: str):
         logger.error(f"Failed to fetch source for alignment. Skipping alignment for {repo}")
         return
 
-    alignment_output_path = run_alignment(source_repo_dir, repo_dir, str(alignment_dir))
+    try:
+        alignment_output_path = run_alignment(source_repo_dir, repo_dir, str(alignment_dir))
+    # AlignmentPipeline calls sys.exit() on some errors
+    except (Exception, SystemExit) as e:
+        raise AlignmentError(_describe_error(e)) from e
 
     alignment_object_key = f"{user}/{repo}/{ALIGNMENT_RESULTS_FILENAME}"
     upload_to_blob_storage(
