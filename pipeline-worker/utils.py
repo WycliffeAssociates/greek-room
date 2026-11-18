@@ -73,7 +73,11 @@ def split_alignment_zip_by_prefix(zip_path: Path, output_dir: Path) -> List[Path
 
 def fetch_source_for_alignment(repo_path: Path, output_dir: Path, default_branch: str = "master") -> Path | None:
     os.makedirs(str(output_dir), exist_ok=True)
-    source_id, source_language, source_version = load_source_from_yaml(repo_path / "manifest.yaml")
+    source = load_source_from_yaml(repo_path / "manifest.yaml")
+    if source is None:
+        logger.warning(f"No source listed in {repo_path / 'manifest.yaml'}")
+        return None
+    source_id, source_language, source_version = source
     base_url = f"{CONTENT_SERVER_URL}/{source_language}_{source_id}"
     headers = { 'User-Agent': 'btt-writer-greekroom' }
 
@@ -97,11 +101,15 @@ def fetch_source_for_alignment(repo_path: Path, output_dir: Path, default_branch
 
     return None
 
-def load_source_from_yaml(path: str) -> tuple[str, str, str]:
+def load_source_from_yaml(path: str) -> tuple[str, str, str] | None:
+        """Return the manifest's first source, or None if it lists none."""
         with open(path, 'r') as f:
             manifest = yaml.safe_load(f)
 
-        source = manifest['dublin_core']['source'][0]
+        sources = (manifest.get('dublin_core') or {}).get('source')
+        if not sources:
+            return None
+        source = sources[0]
         source_id = source['identifier']
         source_language = source['language']
         source_version = source['version']
