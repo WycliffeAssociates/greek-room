@@ -1133,8 +1133,9 @@ class AlignmentModel:
         b_a_weighted_count = 0.0
         for a in self.stem_to_surf[a_stem]:
             for b in rev.stem_to_surf[b_stem]:
-                a_b_weighted_count += self.bi_weighted_counts[(a, b)]
-                b_a_weighted_count += rev.bi_weighted_counts[(b, a)]
+                # .get(): indexing the defaultdict would store a zero for every unaligned pair
+                a_b_weighted_count += self.bi_weighted_counts.get((a, b), 0.0)
+                b_a_weighted_count += rev.bi_weighted_counts.get((b, a), 0.0)
                 # if verbose and self.bi_weighted_counts[(a, b)]:
                 #     sys.stderr.write(f'     F {a} {b} {self.bi_weighted_counts[(a, b)]}\n')
         if a_b_weighted_count / a_stem_count >= 0.1 and a_b_weighted_count / b_stem_count >= 0.1:
