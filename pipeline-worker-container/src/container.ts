@@ -11,6 +11,12 @@ const CHECK_INTERVAL_S = 60;
 const DISPATCH_TIMEOUT_MS = 5 * 60 * 1000;
 const STATUS_TIMEOUT_MS = 30 * 1000;
 
+/** GET /jobs/{id} on the container. A failed job has an error. */
+type ContainerJobStatus = {
+	status: string; // "running" | "done" | "failed" | "unknown"
+	error?: string;
+};
+
 /**
  * Container class for the pipeline-worker background service.
  *
@@ -177,14 +183,21 @@ export class PipelineWorkerContainer extends Container<Env> {
 			return false;
 		}
 
-		switch (await this.fetchJobStatus(job)) {
+		const info = await this.fetchJobStatus(job);
+		switch (info.status) {
 			case "done":
 				this.jobs.finish(job, "done");
 				console.log(`Job ${job.id} for ${job.repo_key} done`);
 				return false;
-			case "failed":
-				this.jobs.requeue(job, "job failed in the container (see container logs)");
+			case "failed": {
+				// Not retried: the job crashed on the repo's content, which a retry
+				// would see again (e.g. ualign.py out of memory). POST /jobs/retry
+				// retries it by hand.
+				const reason = `job failed in the container: ${info.error ?? "see container logs"}`;
+				this.jobs.finish(job, "failed", reason);
+				console.error(`Job ${job.id} for ${job.repo_key} failed: ${reason}`);
 				return false;
+			}
 			case "running":
 				if (Date.now() - (job.started_at ?? 0) > MAX_RUN_MINUTES * 60 * 1000) {
 					// SIGKILL: on SIGTERM the container waits for the hung job thread.
@@ -201,18 +214,18 @@ export class PipelineWorkerContainer extends Container<Env> {
 	}
 
 	/** The container's status for the job; "running" if the check fails. */
-	private async fetchJobStatus(job: JobRow): Promise<string> {
+	private async fetchJobStatus(job: JobRow): Promise<ContainerJobStatus> {
 		try {
 			const res = await this.containerFetch(`http://container/jobs/${job.id}`, {
 				signal: AbortSignal.timeout(STATUS_TIMEOUT_MS),
 			});
 			if (!res.ok) throw new Error(`HTTP ${res.status}`);
-			return ((await res.json()) as { status: string }).status;
+			return (await res.json()) as ContainerJobStatus;
 		} catch (e) {
 			// Treat as transient; MAX_RUN_MINUTES still catches a container that
 			// never answers.
 			console.warn(`Job ${job.id}: status check failed: ${e}`);
-			return "running";
+			return { status: "running" };
 		}
 	}
 
