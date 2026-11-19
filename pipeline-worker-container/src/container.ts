@@ -11,11 +11,10 @@ const CHECK_INTERVAL_S = 60;
 const DISPATCH_TIMEOUT_MS = 5 * 60 * 1000;
 const STATUS_TIMEOUT_MS = 30 * 1000;
 
-/** GET /jobs/{id} on the container. A failed job has error and retryable. */
+/** GET /jobs/{id} on the container. A failed job has an error. */
 type ContainerJobStatus = {
 	status: string; // "running" | "done" | "failed" | "unknown"
 	error?: string;
-	retryable?: boolean; // missing (older container) counts as retryable
 };
 
 /**
@@ -191,14 +190,12 @@ export class PipelineWorkerContainer extends Container<Env> {
 				console.log(`Job ${job.id} for ${job.repo_key} done`);
 				return false;
 			case "failed": {
+				// Not retried: the job crashed on the repo's content, which a retry
+				// would see again (e.g. ualign.py out of memory). POST /jobs/retry
+				// retries it by hand.
 				const reason = `job failed in the container: ${info.error ?? "see container logs"}`;
-				if (info.retryable === false) {
-					// The same input fails the same way, e.g. ualign.py out of memory.
-					this.jobs.finish(job, "failed", reason);
-					console.error(`Job ${job.id} for ${job.repo_key} failed, not retrying: ${reason}`);
-				} else {
-					this.jobs.requeue(job, reason);
-				}
+				this.jobs.finish(job, "failed", reason);
+				console.error(`Job ${job.id} for ${job.repo_key} failed: ${reason}`);
 				return false;
 			}
 			case "running":

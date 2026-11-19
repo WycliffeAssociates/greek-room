@@ -60,19 +60,11 @@ app = FastAPI(
 # The worker thread is not a daemon, so a SIGTERM (deploy, idle stop) lets
 # the current job finish. The Durable Object uses SIGKILL for hung jobs.
 executor = ThreadPoolExecutor(max_workers=1)
-# job id -> {"status": "running" | "done" | "failed", "error"?: str, "retryable"?: bool}
+# job id -> {"status": "running" | "done" | "failed", "error"?: str}
 jobs: Dict[str, Dict[str, Any]] = {}
 # AlignmentPipeline chdirs into the job's temp dir, which is deleted when the
 # job ends; each job returns here so the next clone has a valid cwd.
 APP_DIR = os.getcwd()
-
-
-class AlignmentError(Exception):
-    """
-    The alignment step failed. It only computes on the downloaded repo and
-    source text, so a retry fails the same way (e.g. ualign.py running out of
-    memory); the Durable Object doesn't retry these jobs.
-    """
 
 
 def _describe_error(e: BaseException) -> str:
@@ -128,7 +120,7 @@ async def submit_job(job: JobRequest):
 async def get_job(job_id: str):
     """
     Return the job's status, or "unknown" if this container never ran it.
-    A failed job also has "error" and "retryable".
+    A failed job also has "error".
     """
     return jobs.get(job_id, {"status": "unknown"})
 
@@ -145,10 +137,9 @@ def _run_job(job_id: str, payload: Dict[str, Any]) -> None:
     # AlignmentPipeline calls sys.exit() on some errors, which raises
     # SystemExit (not an Exception) in this thread.
     except (Exception, SystemExit) as e:
-        retryable = not isinstance(e, AlignmentError)
-        error = _describe_error(e) if retryable else f"alignment failed: {e}"
-        jobs[job_id] = {"status": "failed", "error": error[:500], "retryable": retryable}
-        logger.error(f"Job {job_id} for {user}/{repo} failed (retryable={retryable}): {error}", exc_info=True)
+        error = _describe_error(e)
+        jobs[job_id] = {"status": "failed", "error": error[:500]}
+        logger.error(f"Job {job_id} for {user}/{repo} failed: {error}", exc_info=True)
     finally:
         os.chdir(APP_DIR)
 
@@ -219,11 +210,7 @@ def run_greekroom_checks(message: Dict[str, Any], tempdir: str):
         logger.error(f"Failed to fetch source for alignment. Skipping alignment for {repo}")
         return
 
-    try:
-        alignment_output_path = run_alignment(source_repo_dir, repo_dir, str(alignment_dir))
-    # AlignmentPipeline calls sys.exit() on some errors
-    except (Exception, SystemExit) as e:
-        raise AlignmentError(_describe_error(e)) from e
+    alignment_output_path = run_alignment(source_repo_dir, repo_dir, str(alignment_dir))
 
     alignment_object_key = f"{user}/{repo}/{ALIGNMENT_RESULTS_FILENAME}"
     upload_to_blob_storage(
