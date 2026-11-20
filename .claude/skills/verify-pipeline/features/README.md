@@ -4,7 +4,7 @@ This directory is the maintained source for verifying the user-facing behavior o
 
 ## Baseline preconditions
 
-- Run from the repo root with `S=.claude/skills/verify-pipeline/scripts/verify.sh` and a fresh `VERIFY_RUN_ID`.
+- Run from the repo root with `S=pipeline-worker/e2e/verify.sh` and a fresh `VERIFY_RUN_ID`.
 - `$S build` was run after the last Python change, and `$S doctor` shows `image:` equal to `checkout:`.
 - `$S storage-up` is done, and doctor shows `storage: ok ... bucket=True`.
 - The layer the recipe names is up (`$S runner-up` or `$S worker-up`), and doctor reports it `ok` / `[200]`.

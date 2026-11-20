@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Drive the Greek Room alignment pipeline locally for verification.
-# See ../SKILL.md for the workflow. Every instance this script starts is
+# See .claude/skills/verify-pipeline/SKILL.md for the workflow. Every instance this script starts is
 # recorded in $RUN_DIR/state.env, and `down` removes only those.
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUN_ID="${VERIFY_RUN_ID:-default}"
 RUN_DIR="${VERIFY_RUN_DIR:-/tmp/greekroom-verify/$RUN_ID}"
 EVIDENCE="$RUN_DIR/evidence"
@@ -78,7 +78,7 @@ storage_env() { # env flags pointing the pipeline at this run's S3 mock
   echo "R2_SECRET_ACCESS_KEY=$S3_SECRET"
 }
 
-FIXTURE_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../fixtures" && pwd)"
+FIXTURE_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/fixtures" && pwd)"
 # Stage the fixture repo as local git repos the runner clones via file:///fixtures/<repo>:
 #   verify-fixture_3jn_text_ulb   planted findings, manifest lists en_ulb as source (all 6 reports)
 #   verify-nosource_3jn_text_ulb  same text, no dublin_core.source (alignment skipped, 2 reports)
