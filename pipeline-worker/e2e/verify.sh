@@ -5,6 +5,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PY="${VERIFY_PYTHON:-$REPO_ROOT/.virtual/bin/python}"   # host Python; containers use their own
+[ -x "$PY" ] || { echo "error: venv missing at $PY; create it from the repo root: python3 -m venv .virtual" >&2; exit 1; }
 RUN_ID="${VERIFY_RUN_ID:-default}"
 RUN_DIR="${VERIFY_RUN_DIR:-/tmp/greekroom-verify/$RUN_ID}"
 EVIDENCE="$RUN_DIR/evidence"
@@ -31,7 +33,7 @@ save() { # save KEY VALUE into state.env
   mv "$STATE.tmp" "$STATE"
   eval "$1=$(printf %q "$2")"
 }
-free_port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+free_port() { "$PY" -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
 wait_http() { # wait_http URL SECONDS
   local url=$1 deadline=$((SECONDS + $2))
   until curl -sf -o /dev/null "$url"; do
@@ -90,7 +92,7 @@ stage_fixtures() {
     dir="$RUN_DIR/fixtures/$name"
     cp -r "$src" "$dir"
     if [ "$name" = verify-nosource_3jn_text_ulb ]; then
-      python3 - "$dir/manifest.yaml" <<'PY'
+      "$PY" - "$dir/manifest.yaml" <<'PY'
 import re, sys
 p = sys.argv[1]; s = open(p).read()
 s2 = re.sub(r"\n    source:\n(?:        .*\n|            .*\n)+", "\n", s)
@@ -131,18 +133,20 @@ cmd_worker_up() {
   fi
   save WORKER_PORT "$(free_port)"
   save INSPECTOR_PORT "$(free_port)"
-  save JOBS_TOKEN "verify-$(python3 -c 'import secrets;print(secrets.token_hex(12))')"
+  save JOBS_TOKEN "verify-$("$PY" -c 'import secrets;print(secrets.token_hex(12))')"
   { storage_env; echo "JOBS_TOKEN=$JOBS_TOKEN"; } > "$RUN_DIR/worker.env"
   # Containers that exist before launch are not ours; record them so `down` spares them.
   docker ps -aq --no-trunc | sort > "$RUN_DIR/containers.before"
   rm -f "$RUN_DIR/wrangler.pid"
   # setsid may fork, so $! is not reliable: the inner shell writes its own pid,
   # which is the new session's leader, then execs wrangler. `down` kills that session.
-  (cd "$REPO_ROOT/pipeline-worker-container" && \
+  # Redirect the whole background list: a subshell left holding the caller's stdout
+  # would keep a pipe reader (e.g. test_e2e.py) waiting for EOF until wrangler exits.
+  ({ cd "$REPO_ROOT/pipeline-worker-container" && \
     setsid bash -c 'echo $$ > "$0"; exec npx wrangler dev "$@"' "$RUN_DIR/wrangler.pid" \
       --ip 127.0.0.1 --port "$WORKER_PORT" --inspector-port "$INSPECTOR_PORT" \
       --persist-to "$RUN_DIR/wrangler-state" --env-file "$RUN_DIR/worker.env" \
-      --show-interactive-dev-session=false > "$RUN_DIR/wrangler.log" 2>&1 < /dev/null &)
+      --show-interactive-dev-session=false; } > "$RUN_DIR/wrangler.log" 2>&1 < /dev/null &)
   for _ in $(seq 20); do [ -s "$RUN_DIR/wrangler.pid" ] && break; sleep 0.5; done
   save WRANGLER_PID "$(cat "$RUN_DIR/wrangler.pid")"
   local deadline=$((SECONDS + 900))
@@ -185,7 +189,7 @@ cmd_doctor() {
 }
 
 job_payload() { # job_payload USER REPO URL [BRANCH]
-  python3 -c 'import json,sys; a=sys.argv[1:]; print(json.dumps({"User":a[0],"Repo":a[1],"RepoHtmlUrl":a[2],"DefaultBranch":(a[3] if len(a)>3 else "master")}))' "$@"
+  "$PY" -c 'import json,sys; a=sys.argv[1:]; print(json.dumps({"User":a[0],"Repo":a[1],"RepoHtmlUrl":a[2],"DefaultBranch":(a[3] if len(a)>3 else "master")}))' "$@"
 }
 
 cmd_submit() { # submit runner|worker USER REPO URL [BRANCH]
@@ -194,7 +198,7 @@ cmd_submit() { # submit runner|worker USER REPO URL [BRANCH]
   case $target in
     runner)
       local id="verify-$(date +%s)"
-      local body; body="$(python3 -c 'import json,sys;print(json.dumps({"id":sys.argv[1],"payload":json.loads(sys.argv[2])}))' "$id" "$payload")"
+      local body; body="$("$PY" -c 'import json,sys;print(json.dumps({"id":sys.argv[1],"payload":json.loads(sys.argv[2])}))' "$id" "$payload")"
       echo "$body" > "$EVIDENCE/$id.request.json"
       curl -s -w '\n[%{http_code}]\n' -X POST -H 'Content-Type: application/json' -d "$body" "http://127.0.0.1:$RUNNER_PORT/jobs" | tee "$EVIDENCE/$id.submit.txt" >&2
       echo "$id" ;;
@@ -202,7 +206,7 @@ cmd_submit() { # submit runner|worker USER REPO URL [BRANCH]
       echo "$payload" > "$EVIDENCE/worker-submit.request.json"
       local out; out="$(curl -s -w '\n[%{http_code}]' -X POST -H "Authorization: Bearer $JOBS_TOKEN" -H 'Content-Type: application/json' -d "$payload" "http://127.0.0.1:$WORKER_PORT/jobs")"
       echo "$out" >&2
-      local id; id="$(echo "$out" | head -1 | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')"
+      local id; id="$(echo "$out" | head -1 | "$PY" -c 'import json,sys;print(json.load(sys.stdin)["id"])')"
       echo "$out" > "$EVIDENCE/$id.submit.txt"
       echo "$id" ;;
     *) die "submit target must be runner or worker" ;;
@@ -213,7 +217,7 @@ job_status() { # job_status runner|worker ID -> prints JSON for that job
   case $1 in
     runner) curl -s "http://127.0.0.1:$RUNNER_PORT/jobs/$2" ;;
     worker) curl -s -H "Authorization: Bearer $JOBS_TOKEN" "http://127.0.0.1:$WORKER_PORT/jobs" \
-      | python3 -c 'import json,sys; j=[x for x in json.load(sys.stdin) if x["id"]==sys.argv[1]]; print(json.dumps(j[0] if j else {"status":"missing"}))' "$2" ;;
+      | "$PY" -c 'import json,sys; j=[x for x in json.load(sys.stdin) if x["id"]==sys.argv[1]]; print(json.dumps(j[0] if j else {"status":"missing"}))' "$2" ;;
   esac
 }
 
@@ -223,7 +227,7 @@ cmd_wait() { # wait runner|worker ID [TIMEOUT_S]
   local deadline=$((SECONDS + ${3:-1800})) s
   while :; do
     s="$(job_status "$1" "$2")"
-    case "$(echo "$s" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("status"))')" in
+    case "$(echo "$s" | "$PY" -c 'import json,sys;print(json.load(sys.stdin).get("status"))')" in
       done|failed|superseded) echo "$s" | tee "$EVIDENCE/$2.final.json"; break ;;
     esac
     [ $SECONDS -lt $deadline ] || { echo "$s"; die "job $2 still not finished"; }
@@ -252,7 +256,7 @@ print(f'{len(objs)} objects')
 cmd_report_text() { # report-text USER/REPO FILE -> visible text of a downloaded HTML report, one line
   local f="$EVIDENCE/results/$1/$2"
   [ -f "$f" ] || die "$f not found; run: $0 results $1"
-  python3 -c '
+  "$PY" -c '
 import html, re, sys
 t = open(sys.argv[1], encoding="utf-8").read()
 t = re.sub(r"<(style|script)\b.*?</\1>", " ", t, flags=re.S | re.I)

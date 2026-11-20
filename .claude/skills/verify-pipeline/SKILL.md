@@ -22,7 +22,7 @@ export VERIFY_RUN_ID=my-change      # one id per verification run; isolates port
 $S                                  # prints usage
 ```
 
-Requirements: Docker running, `git` on the host (to stage the fixture repos), `node`/`npx` with `pipeline-worker-container/node_modules` installed (`pnpm install` there if missing), and network access to `content.bibletranslationtools.org` (clones and the source-text archive). No 1Password, R2 or Cloudflare credentials are needed. The S3 mock accepts any key.
+Requirements: the repo venv at `.virtual` (host-side Python for the helper and the test; `VERIFY_PYTHON` overrides it), Docker running, `git` on the host (to stage the fixture repos), `node`/`npx` with `pipeline-worker-container/node_modules` installed (`pnpm install` there if missing), and network access to `content.bibletranslationtools.org` (clones and the source-text archive). No 1Password, R2 or Cloudflare credentials are needed. The S3 mock accepts any key.
 
 ## Launch
 
@@ -119,6 +119,21 @@ $S down
 
 This stops the wrangler dev session it started (the whole process session, by recorded leader pid), removes the `workerd-*greekroom-pipeline-worker-PipelineWorkerContainer*` containers that appeared after `worker-up`, and removes the `gr-verify-*-$VERIFY_RUN_ID` containers. It then deletes Durable Object state, env files and the token. Evidence stays. It never kills by process name and never touches containers it didn't start. Run `down` after every failed attempt too, then check `docker ps` for leftover `gr-verify-` or `workerd-` containers.
 
+## End-to-end test
+
+`pipeline-worker/e2e/test_e2e.py` runs the core recipes as one test: it brings a run up with this helper, sends `POST /jobs` for each case, waits for `done`, and asserts the exact object set, content types and report findings from `features/`. Python stdlib only.
+
+```bash
+.virtual/bin/python pipeline-worker/e2e/test_e2e.py                # all cases, about 4 min once images are built
+E2E_CASES=runner_fixture_3jn,runner_nosource_3jn .virtual/bin/python pipeline-worker/e2e/test_e2e.py   # runner only, about 1 min
+E2E_KEEP=1 .virtual/bin/python pipeline-worker/e2e/test_e2e.py     # leave the run up for debugging
+```
+
+- Cases: `worker_es_ulb_test` (worker, `es_ulb_test`), `runner_fixture_3jn` (runner, planted findings) and `runner_nosource_3jn` (runner, no source). A layer with no selected case isn't started.
+- Each run uses its own `VERIFY_RUN_ID=e2e-<timestamp>` and runs `down` at the end, even after a failure. With `E2E_KEEP=1` it prints the `down` command instead. Evidence stays in `/tmp/greekroom-verify/e2e-<timestamp>/evidence/` either way.
+- When a pinned finding changes on purpose, update the case's `markers` in `CASES` together with the feature file.
+- It doesn't cover the job queue API or retry recipes. Drive those by hand.
+
 ## Isolation and gotchas
 
 - Runs with different `VERIFY_RUN_ID`s don't collide: every port is picked fresh and every name carries the run id. Worker runs each get their own `--persist-to` state, but the worker container's image tag is shared (`max_instances: 1` per wrangler session is fine locally).
@@ -134,3 +149,4 @@ This stops the wrangler dev session it started (the whole process session, by re
 
 - `pipeline-worker/e2e/fixtures/verify-fixture_3jn_text_ulb/`: the planted-findings repo (`manifest.yaml`, `65-3JN.usfm`). `runner-up` copies it into the run directory as two git repos (with and without source). Change the USFM only together with the expected findings in `features/duplicate-check.md` and `features/wildebeest-analysis.md`.
 - `pipeline-worker/e2e/verify.sh`: the only helper (executable). Run it with no arguments for usage. State for a run lives in `/tmp/greekroom-verify/$VERIFY_RUN_ID/state.env`. `VERIFY_RUN_DIR` overrides the whole directory.
+- `pipeline-worker/e2e/test_e2e.py`: the end-to-end test built on this helper. See [End-to-end test](#end-to-end-test).
