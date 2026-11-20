@@ -83,7 +83,7 @@ $S wait worker "$id"
 $S results anonymouswalker/es_ulb_test
 ```
 
-Runner and worker write the same `anonymouswalker/es_ulb_test/` keys, and `results` downloads into the same evidence folder. To keep both, rename `evidence/results/anonymouswalker/es_ulb_test` (and its `.listing.txt`) after the first `results`.
+Runner and worker write the same `anonymouswalker/es_ulb_test/` keys, and `results` downloads into the same evidence folder. To keep both, rename `evidence/results/anonymouswalker/es_ulb_test` (and its `.listing.txt`) after the first `results`. The bucket keeps every earlier job's objects too, so run `$S clear anonymouswalker/es_ulb_test` before a submit whose uploads you will check.
 
 For raw HTTP against the worker (auth, retry, bad input), read the port and token from the run's state:
 
@@ -121,18 +121,20 @@ This stops the wrangler dev session it started (the whole process session, by re
 
 ## End-to-end test
 
-`pipeline-worker/e2e/test_e2e.py` runs the core recipes as one test: it brings a run up with this helper, sends `POST /jobs` for each case, waits for `done`, and asserts the exact object set, content types and report findings from `features/`. Python stdlib only.
+`pipeline-worker/e2e/test_e2e.py` runs the core recipes as one test: it brings a run up with this helper, sends `POST /jobs` for each case, waits for the job to end, and asserts its status, `attempts` and `last_error`, then the exact object set, content types and report findings from `features/`. Python stdlib only.
 
 ```bash
-.virtual/bin/python pipeline-worker/e2e/test_e2e.py                # all cases, about 4 min once images are built
+.virtual/bin/python pipeline-worker/e2e/test_e2e.py                # all cases, about 12 min once images are built
 E2E_CASES=runner_fixture_3jn,runner_nosource_3jn .virtual/bin/python pipeline-worker/e2e/test_e2e.py   # runner only, about 1 min
 E2E_KEEP=1 .virtual/bin/python pipeline-worker/e2e/test_e2e.py     # leave the run up for debugging
 ```
 
-- Cases: `worker_es_ulb_test` (worker, `es_ulb_test`), `runner_fixture_3jn` (runner, planted findings) and `runner_nosource_3jn` (runner, no source). A layer with no selected case isn't started.
+- Cases, run in this order: `worker_es_ulb_test` (worker, `es_ulb_test`), `worker_crash_then_retry` (the container is killed on attempt 1; `done` after attempt 2, about 4 min), `worker_crash_every_attempt` (killed on attempts 1 to 3; `failed` after 3, about 3.5 min), `runner_fixture_3jn` (runner, planted findings) and `runner_nosource_3jn` (runner, no source). A layer with no selected case isn't started.
+- Before each submit the test runs `verify.sh clear <user>/<repo>` and deletes that repo's downloaded results, so a case can't pass on objects an earlier case uploaded. Keep that rule for any new case: the worker cases share one repo.
+- A case's fault plan (`kill_on_attempts`) runs `verify.sh fault kill-container` once an attempt is 20 s old. The case fails if a planned kill didn't happen. Its expected `expect_status`, `expect_attempts` and `expect_error` are written out, not derived from the plan.
 - Each run uses its own `VERIFY_RUN_ID=e2e-<timestamp>` and runs `down` at the end, even after a failure. With `E2E_KEEP=1` it prints the `down` command instead. Evidence stays in `/tmp/greekroom-verify/e2e-<timestamp>/evidence/` either way.
 - When a pinned finding changes on purpose, update the case's `markers` in `CASES` together with the feature file.
-- It doesn't cover the job queue API or retry recipes. Drive those by hand.
+- It covers the crash retry and the 3-attempt cap, but not the job queue API or `POST /jobs/retry`. Drive those by hand.
 
 ## Isolation and gotchas
 

@@ -253,6 +253,30 @@ print(f'{len(objs)} objects')
 " "$prefix" "/evidence/results/$prefix" | tee "$dest.listing.txt"
 }
 
+cmd_clear() { # clear USER/REPO -> delete every object under that prefix
+  [[ "${1:-}" =~ ^[^/]+/[^/]+$ ]] || die "usage: clear USER/REPO"
+  s3py "
+prefix, n = sys.argv[1] + '/', 0
+for page in s3.get_paginator('list_objects_v2').paginate(Bucket=B, Prefix=prefix):
+    for o in page.get('Contents', []):
+        s3.delete_object(Bucket=B, Key=o['Key']); n += 1
+print(f'deleted {n} objects under {prefix}')
+" "$1"
+}
+
+cmd_fault() { # fault kill-container -> SIGKILL this run's app container mid-job
+  [ "${1:-}" = kill-container ] || die "usage: fault kill-container"
+  [ -f "$RUN_DIR/containers.before" ] || die "worker not started in this run; run: $0 worker-up"
+  # Running, created since worker-up, and not wrangler's -proxy sidecar.
+  local apps; apps="$(docker ps --no-trunc --format '{{.ID}} {{.Names}}' \
+      -f 'name=workerd-.*greekroom-pipeline-worker-PipelineWorkerContainer' \
+    | awk 'FILENAME == ARGV[1] {old[$1]; next} !($1 in old) && $2 !~ /-proxy$/' "$RUN_DIR/containers.before" -)"
+  [ -n "$apps" ] || die "no running app container from this run's worker"
+  [ "$(wc -l <<< "$apps")" -eq 1 ] || die "more than one candidate app container: $apps"
+  docker kill "${apps%% *}" >/dev/null
+  echo "${apps#* }"
+}
+
 cmd_report_text() { # report-text USER/REPO FILE -> visible text of a downloaded HTML report, one line
   local f="$EVIDENCE/results/$1/$2"
   [ -f "$f" ] || die "$f not found; run: $0 results $1"
@@ -298,6 +322,8 @@ usage: $(basename "$0") <command> [args]   (env: VERIFY_RUN_ID, VERIFY_RUN_DIR)
   wait   runner|worker ID [TIMEOUT]  poll until done/failed; saves logs to evidence
   results USER/REPO                  list + download uploaded reports into evidence
   report-text USER/REPO FILE         print an HTML report's visible text (also saved as FILE.txt)
+  clear USER/REPO                    delete every object under that prefix in the run's bucket
+  fault kill-container               docker kill the worker's running app container (not its -proxy); prints its name
   down                               remove everything this run started (keeps evidence)
 EOF
 }
@@ -313,6 +339,8 @@ case "${1:-}" in
   wait) shift; cmd_wait "$@" ;;
   results) shift; cmd_results "$@" ;;
   report-text) shift; cmd_report_text "$@" ;;
+  clear) shift; cmd_clear "$@" ;;
+  fault) shift; cmd_fault "$@" ;;
   down) cmd_down ;;
   *) usage; exit 2 ;;
 esac

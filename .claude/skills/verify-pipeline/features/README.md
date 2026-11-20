@@ -35,4 +35,4 @@ Each feature file starts with an H1 title and one paragraph describing the user-
 - [Duplicate check](./duplicate-check.md): repeated words found and reported, with exact expected findings for `es_ulb_test` and the planted fixture.
 - [Wildebeest analysis](./wildebeest-analysis.md): script and character report. A clean baseline from `es_ulb_test`, and planted foreign-script and non-canonical findings from the fixture.
 - [Job queue API](./job-queue-api.md): the token-protected `/jobs` routes. Auth, input validation, listing and per-repo merging.
-- [Failed jobs and retry](./retry-failed-jobs.md): a job that fails in the container is recorded with its reason, isn't retried automatically, and `POST /jobs/retry` re-runs it.
+- [Failed jobs and retry](./retry-failed-jobs.md): a job that fails in the container is recorded with its reason, isn't retried automatically, and `POST /jobs/retry` re-runs it. A container crash mid-job is retried, up to 3 attempts.

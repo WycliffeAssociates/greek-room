@@ -9,7 +9,7 @@ findings measured in .claude/skills/verify-pipeline/features/.
 Run from the repo root with `.virtual/bin/python pipeline-worker/e2e/test_e2e.py`,
 or `../../.virtual/bin/python -m unittest` from this directory. Needs the repo
 venv (`.virtual`), Docker, node with pipeline-worker-container/node_modules
-installed, and network access to WACS. A full run takes about 4 minutes once the
+installed, and network access to WACS. A full run takes about 12 minutes once the
 images are built; the first build adds several more.
 
 Env:
@@ -21,6 +21,7 @@ Env:
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -28,7 +29,7 @@ import unittest
 import urllib.error
 import urllib.request
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 VERIFY = Path(__file__).resolve().parent / "verify.sh"
@@ -53,42 +54,69 @@ class Case:
     # Report file -> substrings its visible text must contain, matched as whole words.
     markers: dict[str, list[str]]
     branch: str = "master"
+    # Worker only: `docker kill` the app container mid-run on these attempt numbers.
+    kill_on_attempts: tuple[int, ...] = ()
+    # The job's terminal row. attempts and last_error are checked on the worker only.
+    expect_status: str = "done"
+    expect_attempts: int = 1
+    expect_error: str | None = None
 
     @property
     def books(self) -> list[str]:
         return [m[1] for k in self.objects if (m := re.fullmatch(r"alignments/(\w+)\.zip", k))]
 
 
+WORKER_ES_ULB_TEST = Case(
+    name="worker_es_ulb_test",
+    layer="worker",
+    user="anonymouswalker",
+    repo="es_ulb_test",
+    repo_url="https://content.bibletranslationtools.org/anonymouswalker/es_ulb_test",
+    objects={
+        "alignment.zip": ZIP,
+        "alignments/GEN.zip": ZIP,
+        "alignments/EXO.zip": ZIP,
+        "alignments/index.json": JSON,
+        "duplicate-check-output.html": HTML,
+        "tgt-spellings.html": HTML,
+        "wildebeest-results.html": HTML,
+    },
+    markers={
+        "duplicate-check-output.html": [
+            "consecutive duplicates): 40 instances",
+            "el el (8)",
+            "él él (4)",
+            "abraham abraham (3)",
+        ],
+        "wildebeest-results.html": [
+            "Wildebeest Analysis Report for anonymouswalker/es_ulb_test",
+            "Letter scripts: 1 LATIN (283588 instances)",
+            "Non-canonical character combinations: 0",
+            "Character conflict sets: 0",
+        ],
+    },
+)
+
+CONTAINER_STOPPED = "container stopped while the job was running"
+
 CASES = [
-    Case(
-        name="worker_es_ulb_test",
-        layer="worker",
-        user="anonymouswalker",
-        repo="es_ulb_test",
-        repo_url="https://content.bibletranslationtools.org/anonymouswalker/es_ulb_test",
-        objects={
-            "alignment.zip": ZIP,
-            "alignments/GEN.zip": ZIP,
-            "alignments/EXO.zip": ZIP,
-            "alignments/index.json": JSON,
-            "duplicate-check-output.html": HTML,
-            "tgt-spellings.html": HTML,
-            "wildebeest-results.html": HTML,
-        },
-        markers={
-            "duplicate-check-output.html": [
-                "consecutive duplicates): 40 instances",
-                "el el (8)",
-                "él él (4)",
-                "abraham abraham (3)",
-            ],
-            "wildebeest-results.html": [
-                "Wildebeest Analysis Report for anonymouswalker/es_ulb_test",
-                "Letter scripts: 1 LATIN (283588 instances)",
-                "Non-canonical character combinations: 0",
-                "Character conflict sets: 0",
-            ],
-        },
+    WORKER_ES_ULB_TEST,
+    # A crash the Durable Object must retry: the next attempt runs the job to done.
+    replace(
+        WORKER_ES_ULB_TEST,
+        name="worker_crash_then_retry",
+        kill_on_attempts=(1,),
+        expect_attempts=2,
+        expect_error=CONTAINER_STOPPED,
+    ),
+    # A crash on every attempt: the job fails after MAX_ATTEMPTS (3), never done.
+    replace(
+        WORKER_ES_ULB_TEST,
+        name="worker_crash_every_attempt",
+        kill_on_attempts=(1, 2, 3),
+        expect_status="failed",
+        expect_attempts=3,
+        expect_error=CONTAINER_STOPPED,
     ),
     Case(
         name="runner_fixture_3jn",
@@ -140,6 +168,8 @@ CASES = [
 
 TIMEOUT_S = {"worker": 30 * 60, "runner": 10 * 60}
 POLL_S = {"worker": 15, "runner": 5}
+# A planned kill waits this long into the attempt, so the job is past clone and mid-run.
+KILL_AFTER_S = 20
 
 
 def selected_cases() -> list[Case]:
@@ -204,14 +234,28 @@ class PipelineE2E(unittest.TestCase):
     def run_case(self, case: Case):
         if case not in self.cases:
             self.skipTest("not selected by E2E_CASES")
-        status = self.submit_and_wait(case)
-        self.assertEqual(status.get("status"), "done", f"{case.name}: job did not finish done: {status}")
-        if case.layer == "worker":
-            self.assertEqual(status.get("attempts"), 1, f"{case.name}: {status}")
-            self.assertIsNone(status.get("last_error"), f"{case.name}: {status}")
-        self.check_storage(case)
+        # Start from an empty prefix, so the checks below can only see this case's uploads.
+        print(self.verify("clear", f"{case.user}/{case.repo}").strip(), file=sys.stderr)
+        results = self.run_dir / "evidence" / "results" / case.user
+        shutil.rmtree(results / case.repo, ignore_errors=True)
+        (results / f"{case.repo}.listing.txt").unlink(missing_ok=True)
 
-    def submit_and_wait(self, case: Case) -> dict:
+        started = time.monotonic()
+        status, kills = self.submit_and_wait(case)
+        print(f"{case.name}: {status.get('status')} after {time.monotonic() - started:.0f} s, "
+              f"attempts {status.get('attempts')}, kills {kills}", file=sys.stderr)
+        context = f"{case.name}: {status}; kills (attempt, s after submit): {kills}"
+        self.assertEqual(status.get("status"), case.expect_status, context)
+        if case.layer == "worker":
+            self.assertEqual(status.get("attempts"), case.expect_attempts, context)
+            self.assertEqual(status.get("last_error"), case.expect_error, context)
+        # A job that ends before a planned kill never exercised the fault.
+        self.assertEqual([a for a, _ in kills], list(case.kill_on_attempts), context)
+        if case.expect_status == "done":
+            self.check_storage(case)
+
+    def submit_and_wait(self, case: Case) -> tuple[dict, list[tuple[int, int]]]:
+        """The job's terminal status, and the planned kills made while it ran."""
         payload = {"User": case.user, "Repo": case.repo, "RepoHtmlUrl": case.repo_url, "DefaultBranch": case.branch}
         if case.layer == "worker":
             base, token = f"http://127.0.0.1:{self.state['WORKER_PORT']}", self.state["JOBS_TOKEN"]
@@ -224,7 +268,9 @@ class PipelineE2E(unittest.TestCase):
             code, body = http("POST", f"{base}/jobs", {"id": job_id, "payload": payload})
             self.assertEqual(code, 202, f"{case.name}: runner POST /jobs: {body}")
 
-        deadline = time.monotonic() + TIMEOUT_S[case.layer]
+        submitted = time.monotonic()
+        deadline = submitted + TIMEOUT_S[case.layer]
+        kills: list[tuple[int, int]] = []
         while True:
             if case.layer == "worker":
                 code, rows = http("GET", f"{base}/jobs", token=token)
@@ -234,9 +280,19 @@ class PipelineE2E(unittest.TestCase):
                 code, status = http("GET", f"{base}/jobs/{job_id}")
                 self.assertEqual(code, 200, f"{case.name}: runner GET /jobs/{job_id}: {status}")
             if status.get("status") in ("done", "failed", "superseded"):
-                return status
+                return status, kills
             if time.monotonic() > deadline:
-                self.fail(f"{case.name}: job {job_id} not finished after {TIMEOUT_S[case.layer]} s: {status}")
+                self.fail(f"{case.name}: job {job_id} not finished after {TIMEOUT_S[case.layer]} s: {status}; kills {kills}")
+            attempt = status.get("attempts")
+            if (
+                status.get("status") == "running"
+                and attempt in case.kill_on_attempts
+                and attempt not in [a for a, _ in kills]
+                and time.time() - status["started_at"] / 1000 >= KILL_AFTER_S
+            ):
+                killed = self.verify("fault", "kill-container").strip()
+                kills.append((attempt, round(time.monotonic() - submitted)))
+                print(f"{case.name}: killed {killed} on attempt {attempt}, {kills[-1][1]} s after submit", file=sys.stderr)
             time.sleep(POLL_S[case.layer])
 
     def check_storage(self, case: Case):
@@ -266,6 +322,11 @@ class PipelineE2E(unittest.TestCase):
 
 for _case in CASES:
     setattr(PipelineE2E, f"test_{_case.name}", lambda self, c=_case: self.run_case(c))
+
+
+def load_tests(loader, tests, pattern):
+    """Run the cases in CASES order rather than by name."""
+    return unittest.TestSuite(PipelineE2E(f"test_{c.name}") for c in CASES)
 
 
 if __name__ == "__main__":
