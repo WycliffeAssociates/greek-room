@@ -1,0 +1,29 @@
+---
+dublin_core:
+    conformsto: rc0.2
+    creator: Greek Room verification fixture
+    description: "Planted findings for the verify-pipeline skill. Not a translation."
+    format: text/usfm
+    identifier: ulb
+    language:
+        direction: ltr
+        identifier: en-x-verify
+        title: English verify fixture
+    rights: CC0
+    source:
+        - 
+            identifier: ulb
+            language: en
+            version: "1"
+    subject: Bible
+    title: Verification fixture
+    type: bundle
+    version: "1"
+projects:
+    - 
+        title: 3 John
+        identifier: 3jn
+        sort: 65
+        path: ./65-3JN.usfm
+        categories:
+            - bible-nt
